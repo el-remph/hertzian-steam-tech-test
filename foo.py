@@ -1,12 +1,32 @@
 #!/usr/bin/python
 import datetime
 import json
+import jsonschema
 import hashlib
 import requests
 
 # TODO: schema
 
 class Review:
+	# In another language I would say `static const'. In python, I will just
+	# comment: pls no mutate
+	schema = {
+		"type": "object",
+		"properties": {
+			"id":	{"type": "string"},	# should be an integer, but steam gives it as
+							# a string so maybe they know something
+			"author":	{"type": "string"},	# actually a hex string... should we store
+								# as an integer?
+			"date":	{"type": "string", "format": "date"},
+			"hours":	{"type": "integer"},
+			"content":	{"type": "string"},
+			"comments":	{"type": "integer"},
+			"helpful":	{"type": "integer"},
+			"funny":	{"type": "integer"},
+			"recommended":	{"type": "boolean"}
+		}
+	}
+
 	# obj is a decoded json dict from the reviews array
 	def __init__(self, obj):
 		# TODO: in perl, an object is just syntactic sugar for a dict. Can
@@ -26,6 +46,7 @@ class Review:
 			# TODO: franchise and gameName -- are they really to be stored
 			# separately for each review?
 		}
+		jsonschema.validate(self.obj, self.schema, format_checker=jsonschema.Draft202012Validator.FORMAT_CHECKER)
 
 	def __str__(self):
 		return json.dumps(self.obj)

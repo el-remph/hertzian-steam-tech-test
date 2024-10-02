@@ -8,25 +8,6 @@ import requests
 # TODO: schema
 
 class Review:
-	# In another language I would say `static const'. In python, I will just
-	# comment: pls no mutate
-	schema = {
-		"type": "object",
-		"properties": {
-			"id":	{"type": "string"},	# should be an integer, but steam gives it as
-							# a string so maybe they know something
-			"author":	{"type": "string"},	# actually a hex string... should we store
-								# as an integer?
-			"date":	{"type": "string", "format": "date"},
-			"hours":	{"type": "integer"},
-			"content":	{"type": "string"},
-			"comments":	{"type": "integer"},
-			"helpful":	{"type": "integer"},
-			"funny":	{"type": "integer"},
-			"recommended":	{"type": "boolean"}
-		}
-	}
-
 	# obj is a decoded json dict from the reviews array
 	def __init__(self, obj):
 		# TODO: in perl, an object is just syntactic sugar for a dict. Can
@@ -46,19 +27,54 @@ class Review:
 			# TODO: franchise and gameName -- are they really to be stored
 			# separately for each review?
 		}
-		jsonschema.validate(self.obj, self.schema, format_checker=jsonschema.Draft202012Validator.FORMAT_CHECKER)
 
 	def __str__(self):
 		return json.dumps(self.obj)
 
-def somethingelse(response_obj):
-	return [Review(x).obj for x in response_obj['reviews']]
+schema = {
+	"type": "array",
+	"items": {
+		"type": "object",
+		"properties": {
+			"id":	{"type": "string"},	# should be an integer, but steam gives it as
+										# a string so maybe they know something
+			"author":	{"type": "string"},	# actually a hex string... should we store
+											# as an integer?
+			"date":	{"type": "string", "format": "date"},
+			"hours":	{"type": "integer"},
+			"content":	{"type": "string"},
+			"comments":	{"type": "integer"},
+			"helpful":	{"type": "integer"},
+			"funny":	{"type": "integer"},
+			"recommended":	{"type": "boolean"}
+		}
+	}
+}
 
 def steam_api_request(steamid):
-	r = requests.get("https://store.steampowered.com/appreviews/{:d}".format(steamid), params={'json':1})
-	r.raise_for_status()
-	return json.dumps(somethingelse(r.json()))
+	reviews = []
+	cursor = '*'
+	n_requested = 100 # max supported by steam as of 2024-10-02
 
-# test (doesn't call steam_api_request because that would be rude; opens
-# cached output instead)
-print(json.dumps(somethingelse(json.load(open("1158310.json", "r"))), indent="\t"))
+	while True:
+		r = requests.get("https://store.steampowered.com/appreviews/{:d}".format(steamid),
+						params={'json':1, 'num_per_page':n_requested, 'cursor':cursor})
+		r.raise_for_status()
+		response_obj = r.json()
+		if not response_obj['success']:
+			raise Exception('bad response')
+
+		reviews += [Review(x).obj for x in response_obj['reviews']]
+
+		n_received = response_obj['query_summary']['num_reviews']
+		assert n_received == len(response_obj['reviews'])
+		if n_received != n_requested:
+			break
+		cursor = response_obj['cursor']
+
+	jsonschema.validate(reviews, schema,
+					format_checker=jsonschema.Draft202012Validator.FORMAT_CHECKER)
+	return reviews
+
+# test
+print(json.dumps(steam_api_request(1158310), indent="\t"))

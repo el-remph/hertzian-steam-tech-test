@@ -1,30 +1,12 @@
 #!/usr/bin/python
 # vim: noexpandtab
 import datetime
+import enum
 import hashlib
 import json
 import jsonschema
 import logging
 import requests
-
-# transforms steam input format review into output format review. obj is a
-# decoded json dict from the reviews array
-def xform_review(obj):
-	return {
-		'id'		: obj['recommendationid'],
-		'author'	: hashlib.blake2s(obj['author']['steamid'].encode('utf-8'), digest_size=28).hexdigest(),
-		# TODO: UTC? timestamp_updated or timestamp_created?
-		'date'		: datetime.date.fromtimestamp(obj['timestamp_updated']).isoformat(),
-		'hours'		: obj['author']['playtime_at_review'], # TODO: check presumption
-		'content'	: obj['review'],
-		'comments'	: obj['comment_count'],
-		'source'	: 'steam',
-		'helpful'	: obj['votes_up'],
-		'funny'		: obj['votes_funny'],
-		'recommended' : obj['voted_up'] # apparently
-		# TODO: franchise and gameName -- are they really to be stored
-		# separately for each review?
-	}
 
 schema = {
 	"type": "array",
@@ -48,14 +30,46 @@ schema = {
 }
 
 class Review_Stream:
-	def __init__(self, steamid):
+	class Date_Type(enum.Enum):
+		CREATED = 0
+		UPDATED = 1
+
+	def __init__(self, steamid, date_type):
 		self.steamid = steamid # constant
 		self.cursor = '*' # assigned anew on each iteration
 		self.connection = requests.Session() # just to reuse the TCP connection
+		match date_type:
+			case self.Date_Type.CREATED:
+				self.filter = 'recent'
+				self.timestamp = 'timestamp_created'
+			case self.Date_Type.UPDATED:
+				self.filter = 'updated'
+				self.timestamp = 'timestamp_updated'
+			case _:
+				raise TypeError
+
+	# transforms steam input format review into output format review. obj is a
+	# decoded json dict from the reviews array
+	def xform_review(self, obj):
+		return {
+			'id'		: obj['recommendationid'],
+			'author'	: hashlib.blake2s(obj['author']['steamid'].encode('utf-8'), digest_size=28).hexdigest(),
+			# TODO: UTC? timestamp_updated or timestamp_created?
+			'date'		: datetime.date.fromtimestamp(obj[self.timestamp]).isoformat(),
+			'hours'		: obj['author']['playtime_at_review'], # TODO: check presumption
+			'content'	: obj['review'],
+			'comments'	: obj['comment_count'],
+			'source'	: 'steam',
+			'helpful'	: obj['votes_up'],
+			'funny'		: obj['votes_funny'],
+			'recommended' : obj['voted_up'] # apparently
+			# TODO: franchise and gameName -- are they really to be stored
+			# separately for each review?
+		}
 
 	def nextbatch(self, n_max):
 		r = self.connection.get("https://store.steampowered.com/appreviews/{:d}".format(self.steamid),
-						params={'json':1, 'filter':'recent', 'num_per_page':n_max, 'cursor':self.cursor})
+						params={'json':1, 'filter':self.filter, 'num_per_page':n_max, 'cursor':self.cursor})
 		r.raise_for_status()
 
 		self.response_obj = r.json()
@@ -65,7 +79,7 @@ class Review_Stream:
 
 		self.cursor = self.response_obj['cursor'] # TODO: send next request asynchronously here, if not eof
 
-		reviews = [xform_review(x) for x in self.response_obj['reviews']]
+		reviews = [self.xform_review(x) for x in self.response_obj['reviews']]
 		jsonschema.validate(reviews, schema,
 						format_checker=jsonschema.Draft202012Validator.FORMAT_CHECKER)
 		return reviews
@@ -99,7 +113,7 @@ class Split_Reviews:
 		json.dump(self.reviews[:writeme], open(outfilename, "wt"), indent="\t")
 		del self.reviews[:writeme]
 
-	def __init__(self, steamid, per_file=5000):
+	def __init__(self, steamid, per_file=5000, date_type=Review_Stream.Date_Type.CREATED):
 		self.steamid = steamid	# constant
 		self.reviews = []	# accumulates with each iteration
 		self.ids = {}	# counts frequency of each id (should all be 1)
@@ -107,7 +121,7 @@ class Split_Reviews:
 		self.file_i = 0	# incremented monotonically
 		self.per_file = per_file	# constant
 		self.eof = False
-		self.steam = Review_Stream(steamid)
+		self.steam = Review_Stream(steamid, date_type)
 
 		# First request: get total_reviews also
 		self.getbatch()

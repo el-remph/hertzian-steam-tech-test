@@ -1,4 +1,5 @@
 #!/usr/bin/python
+# vim: noexpandtab
 import datetime
 import hashlib
 import json
@@ -6,28 +7,24 @@ import jsonschema
 import logging
 import requests
 
-# TODO: schema
-
 # transforms steam input format review into output format review. obj is a
 # decoded json dict from the reviews array
 def xform_review(obj):
-		# TODO: in perl, an object is just syntactic sugar for a dict. Can
-		# we get a dict from the actual name table of the object itself?
-		return {
-			'id'		: obj['recommendationid'],
-			'author'	: hashlib.sha256(obj['author']['steamid'].encode('utf-8')).hexdigest(),
-			# TODO: UTC? timestamp_updated or timestamp_created?
-			'date'		: datetime.date.fromtimestamp(obj['timestamp_updated']).isoformat(),
-			'hours'		: obj['author']['playtime_at_review'], # TODO: check presumption
-			'content'	: obj['review'],
-			'comments'	: obj['comment_count'],
-			'source'	: 'steam',
-			'helpful'	: obj['votes_up'],
-			'funny'		: obj['votes_funny'],
-			'recommended' : obj['voted_up'] # apparently
-			# TODO: franchise and gameName -- are they really to be stored
-			# separately for each review?
-		}
+	return {
+		'id'		: obj['recommendationid'],
+		'author'	: hashlib.blake2s(obj['author']['steamid'].encode('utf-8'), digest_size=28).hexdigest(),
+		# TODO: UTC? timestamp_updated or timestamp_created?
+		'date'		: datetime.date.fromtimestamp(obj['timestamp_updated']).isoformat(),
+		'hours'		: obj['author']['playtime_at_review'], # TODO: check presumption
+		'content'	: obj['review'],
+		'comments'	: obj['comment_count'],
+		'source'	: 'steam',
+		'helpful'	: obj['votes_up'],
+		'funny'		: obj['votes_funny'],
+		'recommended' : obj['voted_up'] # apparently
+		# TODO: franchise and gameName -- are they really to be stored
+		# separately for each review?
+	}
 
 schema = {
 	"type": "array",
@@ -58,16 +55,15 @@ class Review_Stream:
 
 	def nextbatch(self, n_max):
 		r = self.connection.get("https://store.steampowered.com/appreviews/{:d}".format(self.steamid),
-						params={'json':1, 'num_per_page':n_max, 'cursor':self.cursor})
+						params={'json':1, 'filter':'recent', 'num_per_page':n_max, 'cursor':self.cursor})
 		r.raise_for_status()
 
 		self.response_obj = r.json()
 		if not self.response_obj['success']:
 			raise Exception('bad response')
 		assert self.response_obj['query_summary']['num_reviews'] == len(self.response_obj['reviews'])
-		logging.debug('got {:d} reviews'.format(len(self.response_obj['reviews'])))
 
-		self.cursor = self.response_obj['cursor']
+		self.cursor = self.response_obj['cursor'] # TODO: send next request asynchronously here, if not eof
 
 		reviews = [xform_review(x) for x in self.response_obj['reviews']]
 		jsonschema.validate(reviews, schema,
@@ -75,41 +71,63 @@ class Review_Stream:
 		return reviews
 
 class Split_Reviews:
+	def count_id_frequency(self, reviews):
+		for review in reviews:
+			Id = review['id']
+			if Id in self.ids:
+				self.ids[Id] += 1
+			else:
+				self.ids[Id] = 0
+
 	def getbatch(self):
+		if self.eof:
+			return False
 		reviews = self.steam.nextbatch(self.per_file)
 		self.total -= len(reviews)
+		self.count_id_frequency(reviews)
 		self.reviews += reviews
+		logging.debug('received {:d} reviews, now have {:d}'.format(len(reviews), len(self.reviews)))
+		if len(reviews) == 0:
+			self.eof = True
+		return not self.eof
 
 	def writebatch(self):
 		outfilename = "{:d}.{:d}.json".format(self.steamid, self.file_i)
 		self.file_i += 1 # whatever happend to postincrement?
 		writeme = min(self.per_file, len(self.reviews))
 		logging.info("Writing {} reviews to {}".format(writeme, outfilename))
-		json.dump(self.reviews[:writeme], open(outfilename, "w"), indent="\t")
-		del self.reviews[:writeme] # FIXME: there are duplicate reviews in the output. Does this delete enough?
+		json.dump(self.reviews[:writeme], open(outfilename, "wt"), indent="\t")
+		del self.reviews[:writeme]
 
 	def __init__(self, steamid, per_file=5000):
 		self.steamid = steamid	# constant
 		self.reviews = []	# accumulates with each iteration
+		self.ids = {}	# counts frequency of each id (should all be 1)
 		self.total = 0	# decrements after each iter (set after first as a special case)
 		self.file_i = 0	# incremented monotonically
 		self.per_file = per_file	# constant
+		self.eof = False
 		self.steam = Review_Stream(steamid)
 
 		# First request: get total_reviews also
 		self.getbatch()
 		self.total = self.steam.response_obj['query_summary']['total_reviews'] - len(self.reviews)
 
-		while self.total > 0:
-			self.getbatch()
+		while self.getbatch():
 			if len(self.reviews) >= self.per_file:
 				self.writebatch()
 
 	def __del__(self):
 		while len(self.reviews):
 			self.writebatch()
+
 		if self.total != 0:
 			logging.warning('more reviews than expected: {:d}'.format(-self.total))
+
+		for Id, dups in self.ids.items():
+			if dups != 0:
+				logging.warning('id "{}" has {:d} duplicates'.format(Id, dups))
+
 		logging.debug('final cursor was {}'.format(self.steam.cursor))
 
 # test

@@ -1,3 +1,4 @@
+#!/usr/bin/python3
 # vim: set noexpandtab
 import json
 import sys

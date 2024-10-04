@@ -1,5 +1,5 @@
 #!/usr/bin/python
-# vim: noexpandtab
+# vim: noexpandtab:ts=8
 import datetime
 import enum
 import hashlib
@@ -14,9 +14,9 @@ schema = {
 		"type": "object",
 		"properties": {
 			"id":	{"type": "string"},	# should be an integer, but steam gives it as
-										# a string so maybe they know something
+							# a string so maybe they know something
 			"author":	{"type": "string"},	# actually a hex string... should we store
-											# as an integer?
+								# as an integer?
 			"date":	{"type": "string", "format": "date"},
 			"hours":	{"type": "integer"},
 			"content":	{"type": "string"},
@@ -34,19 +34,39 @@ class Review_Stream:
 		CREATED = 0
 		UPDATED = 1
 
-	def __init__(self, steamid, date_type):
+	def __init__(self, steamid, date_type, date_range):
 		self.steamid = steamid # constant
 		self.cursor = '*' # assigned anew on each iteration
 		self.connection = requests.Session() # just to reuse the TCP connection
+		self.params = {'json':1}
+
 		match date_type:
 			case self.Date_Type.CREATED:
-				self.filter = 'recent'
+				self.params['filter'] = 'recent'
 				self.timestamp = 'timestamp_created'
 			case self.Date_Type.UPDATED:
-				self.filter = 'updated'
+				self.params['filter'] = 'updated'
 				self.timestamp = 'timestamp_updated'
 			case _:
 				raise TypeError
+
+		if date_range is not None:
+			self.params['filter'] = 'all'
+			min_date, max_date = date_range
+#			min_date, max_date = [datetime.date.fromisoformat(d) for d in date_range]
+			min_date = datetime.date.fromisoformat(min_date)
+			max_date = datetime.date.fromisoformat(max_date)
+			today = datetime.date.today()
+			if today < min_date or today < max_date or max_date < min_date:
+				raise Exception('Date order messed up')
+
+			self.max_date = max_date
+
+			timedelta = today - min_date
+			days_ago = abs(timedelta.days)
+			if days_ago > 365:
+				raise Exception('Minimum date cannot be more than 1 year ago')
+			self.params['day_range'] = days_ago
 
 	# transforms steam input format review into output format review. obj is a
 	# decoded json dict from the reviews array
@@ -62,14 +82,14 @@ class Review_Stream:
 			'source'	: 'steam',
 			'helpful'	: obj['votes_up'],
 			'funny'		: obj['votes_funny'],
-			'recommended' : obj['voted_up'] # apparently
+			'recommended'	: obj['voted_up'] # apparently
 			# TODO: franchise and gameName -- are they really to be stored
 			# separately for each review?
 		}
 
 	def nextbatch(self, n_max):
 		r = self.connection.get("https://store.steampowered.com/appreviews/{:d}".format(self.steamid),
-						params={'json':1, 'filter':self.filter, 'num_per_page':n_max, 'cursor':self.cursor})
+					params=self.params | {'num_per_page':n_max, 'cursor':self.cursor})
 		r.raise_for_status()
 
 		self.response_obj = r.json()
@@ -77,11 +97,11 @@ class Review_Stream:
 			raise Exception('bad response')
 		assert self.response_obj['query_summary']['num_reviews'] == len(self.response_obj['reviews'])
 
-		self.cursor = self.response_obj['cursor'] # TODO: send next request asynchronously here, if not eof
+		self.cursor = self.response_obj['cursor'] # TODO: send next request asynchronously here
 
-		reviews = [self.xform_review(x) for x in self.response_obj['reviews']]
+		reviews = [self.xform_review(x) for x in self.response_obj['reviews'] if datetime.date.fromtimestamp(x[self.timestamp]) < self.max_date]
 		jsonschema.validate(reviews, schema,
-						format_checker=jsonschema.Draft202012Validator.FORMAT_CHECKER)
+				format_checker=jsonschema.Draft202012Validator.FORMAT_CHECKER)
 		return reviews
 
 class Split_Reviews:
@@ -94,16 +114,12 @@ class Split_Reviews:
 				self.ids[Id] = 0
 
 	def getbatch(self):
-		if self.eof:
-			return False
 		reviews = self.steam.nextbatch(self.per_file)
 		self.total -= len(reviews)
 		self.count_id_frequency(reviews)
 		self.reviews += reviews
-		logging.debug('received {:d} reviews, now have {:d}'.format(len(reviews), len(self.reviews)))
-		if len(reviews) == 0:
-			self.eof = True
-		return not self.eof
+		nreceived = len(self.steam.response_obj['reviews'])
+		logging.debug('received {:d} review{}, {:d} applicable; now have {:d}, with {:d} to go'.format(nreceived, "" if nreceived == 1 else "s", len(reviews), len(self.reviews), self.total))
 
 	def writebatch(self):
 		outfilename = "{:d}.{:d}.json".format(self.steamid, self.file_i)
@@ -113,21 +129,17 @@ class Split_Reviews:
 		json.dump(self.reviews[:writeme], open(outfilename, "wt"), indent="\t")
 		del self.reviews[:writeme]
 
-	def __init__(self, steamid, per_file=5000, date_type=Review_Stream.Date_Type.CREATED):
-		self.steamid = steamid	# constant
+	def __init__(self, steamid, total_wanted, per_file=5000, date_type=Review_Stream.Date_Type.CREATED, date_range=None):
+		self.steamid = steamid		# constant
+		self.per_file = per_file	# constant
+		self.total = total_wanted	# decrements after each iteration
 		self.reviews = []	# accumulates with each iteration
 		self.ids = {}	# counts frequency of each id (should all be 1)
-		self.total = 0	# decrements after each iter (set after first as a special case)
 		self.file_i = 0	# incremented monotonically
-		self.per_file = per_file	# constant
-		self.eof = False
-		self.steam = Review_Stream(steamid, date_type)
+		self.steam = Review_Stream(steamid, date_type, date_range)
 
-		# First request: get total_reviews also
-		self.getbatch()
-		self.total = self.steam.response_obj['query_summary']['total_reviews'] - len(self.reviews)
-
-		while self.getbatch():
+		while self.total > 0:
+			self.getbatch()
 			if len(self.reviews) >= self.per_file:
 				self.writebatch()
 
@@ -136,7 +148,7 @@ class Split_Reviews:
 			self.writebatch()
 
 		if self.total != 0:
-			logging.warning('more reviews than expected: {:d}'.format(-self.total))
+			logging.warning('{:d} more reviews than requested'.format(-self.total))
 
 		for Id, dups in self.ids.items():
 			if dups != 0:
@@ -146,4 +158,4 @@ class Split_Reviews:
 
 # test
 logging.basicConfig(level=logging.DEBUG)
-Split_Reviews(1158310)
+Split_Reviews(1158310, 15000, date_range=('2023-11-18', '2024-02-12'))

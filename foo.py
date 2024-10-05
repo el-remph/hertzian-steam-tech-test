@@ -6,6 +6,7 @@ import hashlib
 import json
 import jsonschema
 import logging
+import operator
 import requests
 
 schema = {
@@ -131,6 +132,8 @@ class Split_Reviews:
 		self.file_i += 1 # whatever happend to postincrement?
 		writeme = min(self.per_file, len(self.reviews))
 		logging.info("Writing {} reviews to {}".format(writeme, outfilename))
+		self.reviews.sort(key=operator.itemgetter('id'))
+		self.reviews.sort(key=operator.itemgetter('date'), reverse=True)
 		json.dump(self.reviews[:writeme], open(outfilename, "wt"), indent="\t")
 		# Validate *after* dumping, so the bad json can still be inspected
 		# after crash. Validating only up to `writeme' prevents some
@@ -172,4 +175,4 @@ class Split_Reviews:
 
 # test
 logging.basicConfig(level=logging.DEBUG)
-Split_Reviews(1158310, date_range=('2023-11-18', '2024-02-12'))
+Split_Reviews(1382330, date_range=('2023-11-18', '2024-02-12'))

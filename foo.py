@@ -13,10 +13,11 @@ schema = {
 	"items": {
 		"type": "object",
 		"properties": {
-			"id":	{"type": "string"},	# should be an integer, but steam gives it as
-							# a string so maybe they know something
-			"author":	{"type": "string"},	# actually a hex string... should we store
-								# as an integer?
+			# should be an integer, but steam gives it as a
+			# string so maybe they know something
+			"id":	{"type": "string"},
+			# hex string -- should we store as an integer?
+			"author":	{"type": "string", "pattern": "^[A-Fa-f0-9]{56}$"},
 			"date":	{"type": "string", "format": "date"},
 			"hours":	{"type": "integer"},
 			"content":	{"type": "string"},
@@ -103,8 +104,6 @@ class Review_Stream:
 		reviews = [self.xform_review(x)
 				for x in self.response_obj['reviews']
 				if self.min_date <= date.fromtimestamp(x[self.timestamp]) <= self.max_date]
-		jsonschema.validate(reviews, schema,
-				format_checker=jsonschema.Draft202012Validator.FORMAT_CHECKER)
 		return applicable, reviews
 
 class Split_Reviews:
@@ -133,6 +132,11 @@ class Split_Reviews:
 		writeme = min(self.per_file, len(self.reviews))
 		logging.info("Writing {} reviews to {}".format(writeme, outfilename))
 		json.dump(self.reviews[:writeme], open(outfilename, "wt"), indent="\t")
+		# Validate *after* dumping, so the bad json can still be inspected
+		# after crash. Validating only up to `writeme' prevents some
+		# reviews from being validated multiple times needlessly
+		jsonschema.validate(self.reviews[:writeme], schema,
+					format_checker=jsonschema.Draft202012Validator.FORMAT_CHECKER)
 		del self.reviews[:writeme]
 
 	def __init__(self, steamid, date_range, per_file=5000, date_type=Review_Stream.Date_Type.CREATED):

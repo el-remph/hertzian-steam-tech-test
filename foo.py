@@ -1,6 +1,6 @@
 #!/usr/bin/python
 # vim: noexpandtab:ts=8
-import datetime
+from datetime import date
 import enum
 import hashlib
 import json
@@ -50,23 +50,17 @@ class Review_Stream:
 			case _:
 				raise TypeError
 
-		if date_range is not None:
-			self.params['filter'] = 'all'
-			min_date, max_date = date_range
-#			min_date, max_date = [datetime.date.fromisoformat(d) for d in date_range]
-			min_date = datetime.date.fromisoformat(min_date)
-			max_date = datetime.date.fromisoformat(max_date)
-			today = datetime.date.today()
-			if today < min_date or today < max_date or max_date < min_date:
-				raise Exception('Date order messed up')
+		self.params['filter'] = 'all'
+		self.min_date, self.max_date = [date.fromisoformat(d) for d in date_range]
+		today = date.today()
+		if not today >= self.max_date > self.min_date:
+			raise Exception('Date order messed up')
 
-			self.max_date = max_date
-
-			timedelta = today - min_date
-			days_ago = abs(timedelta.days)
-			if days_ago > 365:
-				raise Exception('Minimum date cannot be more than 1 year ago')
-			self.params['day_range'] = days_ago
+		timedelta = today - self.min_date
+		days_ago = abs(timedelta.days)
+		if days_ago > 365:
+			raise Exception('Minimum date cannot be more than 1 year ago')
+		self.params['day_range'] = days_ago
 
 	# transforms steam input format review into output format review. obj is a
 	# decoded json dict from the reviews array
@@ -75,7 +69,7 @@ class Review_Stream:
 			'id'		: obj['recommendationid'],
 			'author'	: hashlib.blake2s(obj['author']['steamid'].encode('utf-8'), digest_size=28).hexdigest(),
 			# TODO: UTC? timestamp_updated or timestamp_created?
-			'date'		: datetime.date.fromtimestamp(obj[self.timestamp]).isoformat(),
+			'date'		: date.fromtimestamp(obj[self.timestamp]).isoformat(),
 			'hours'		: obj['author']['playtime_at_review'], # TODO: check presumption
 			'content'	: obj['review'],
 			'comments'	: obj['comment_count'],
@@ -99,10 +93,19 @@ class Review_Stream:
 
 		self.cursor = self.response_obj['cursor'] # TODO: send next request asynchronously here
 
-		reviews = [self.xform_review(x) for x in self.response_obj['reviews'] if datetime.date.fromtimestamp(x[self.timestamp]) < self.max_date]
+		# Note that `applicable' counts those within min_date, *without*
+		# checking max_date (it's just checking for those that meet
+		# Steam's own criteria), while the ultimate `reviews' uses both
+		# TODO: date.fromtimestamp() is computed for every review twice;
+		# is it worth caching the results of the first one?
+		applicable = len([x for x in self.response_obj['reviews']
+				if self.min_date <= date.fromtimestamp(x[self.timestamp])])
+		reviews = [self.xform_review(x)
+				for x in self.response_obj['reviews']
+				if self.min_date <= date.fromtimestamp(x[self.timestamp]) <= self.max_date]
 		jsonschema.validate(reviews, schema,
 				format_checker=jsonschema.Draft202012Validator.FORMAT_CHECKER)
-		return reviews
+		return applicable, reviews
 
 class Split_Reviews:
 	def count_id_frequency(self, reviews):
@@ -114,12 +117,15 @@ class Split_Reviews:
 				self.ids[Id] = 0
 
 	def getbatch(self):
-		reviews = self.steam.nextbatch(self.per_file)
-		self.total -= len(reviews)
+		applicable, reviews = self.steam.nextbatch(self.per_file)
+		self.total -= applicable
 		self.count_id_frequency(reviews)
 		self.reviews += reviews
 		nreceived = len(self.steam.response_obj['reviews'])
-		logging.debug('received {:d} review{}, {:d} applicable; now have {:d}, with {:d} to go'.format(nreceived, "" if nreceived == 1 else "s", len(reviews), len(self.reviews), self.total))
+		logging.debug('received {:d} review{}; {:d} erroneous, {:d} kept; now have {:d}, with {:d} to go'.format(
+				nreceived, "" if nreceived == 1 else "s",
+				nreceived - applicable, len(reviews),
+				len(self.reviews), self.total))
 
 	def writebatch(self):
 		outfilename = "{:d}.{:d}.json".format(self.steamid, self.file_i)
@@ -129,14 +135,18 @@ class Split_Reviews:
 		json.dump(self.reviews[:writeme], open(outfilename, "wt"), indent="\t")
 		del self.reviews[:writeme]
 
-	def __init__(self, steamid, total_wanted, per_file=5000, date_type=Review_Stream.Date_Type.CREATED, date_range=None):
-		self.steamid = steamid		# constant
+	def __init__(self, steamid, date_range, per_file=5000, date_type=Review_Stream.Date_Type.CREATED):
+		self.steamid = steamid	# constant
 		self.per_file = per_file	# constant
-		self.total = total_wanted	# decrements after each iteration
 		self.reviews = []	# accumulates with each iteration
 		self.ids = {}	# counts frequency of each id (should all be 1)
+		self.total = 0	# decrements after each iter (set after first as a special case)
 		self.file_i = 0	# incremented monotonically
 		self.steam = Review_Stream(steamid, date_type, date_range)
+
+		# First request: get total_reviews also
+		self.getbatch()
+		self.total = self.steam.response_obj['query_summary']['total_reviews'] - len(self.reviews)
 
 		while self.total > 0:
 			self.getbatch()
@@ -148,7 +158,7 @@ class Split_Reviews:
 			self.writebatch()
 
 		if self.total != 0:
-			logging.warning('{:d} more reviews than requested'.format(-self.total))
+			logging.warning('{:d} more reviews than expected'.format(-self.total))
 
 		for Id, dups in self.ids.items():
 			if dups != 0:
@@ -158,4 +168,4 @@ class Split_Reviews:
 
 # test
 logging.basicConfig(level=logging.DEBUG)
-Split_Reviews(1158310, 15000, date_range=('2023-11-18', '2024-02-12'))
+Split_Reviews(1158310, date_range=('2023-11-18', '2024-02-12'))

@@ -9,7 +9,7 @@ min_date, max_date = [date.fromisoformat(arg) for arg in sys.argv[1:3]]
 for arg in sys.argv[3:]:
 	for review in json.load(open(arg, 'r')):
 		datestr = review['date']
-		if not min_date < date.fromisoformat(datestr) < max_date:
+		if not min_date <= date.fromisoformat(datestr) <= max_date:
 			print("{}: Bad date: {}".format(arg, datestr))
 			exit_val = 1
 

@@ -6,6 +6,7 @@ import hashlib
 import json
 import jsonschema
 import logging
+import operator
 import requests
 
 schema = {
@@ -63,7 +64,7 @@ class Review_Stream:
 			'source'	: 'steam',
 			'helpful'	: obj['votes_up'],
 			'funny'		: obj['votes_funny'],
-			'recommended' : obj['voted_up'] # apparently
+			'recommended'	: obj['voted_up'] # apparently
 			# TODO: franchise and gameName -- are they really to be stored
 			# separately for each review?
 		}
@@ -104,18 +105,34 @@ class Split_Reviews:
 			self.eof = True
 		return not self.eof
 
+	def sort_reviews(self, n):
+		# Reviews are received already sorted by date (descending), so it
+		# would be wasteful to sort by id, then by date again. Instead,
+		# pop a contiguous portion of self.reviews with the same date,
+		# sort that, repeat until we have n reviews
+		result = []
+		while len(result) < n:
+			same_date = [self.reviews.pop(0)]
+			while len(same_date) + len(result) < n \
+				and self.reviews[0]['date'] == same_date[0]['date']:
+				same_date += [self.reviews.pop(0)]
+			same_date.sort(key=operator.itemgetter('id'))
+			result += same_date
+		return result
+
 	def writebatch(self):
 		outfilename = "{:d}.{:d}.json".format(self.steamid, self.file_i)
 		self.file_i += 1 # whatever happend to postincrement?
 		writeme = min(self.per_file, len(self.reviews))
 		logging.info("Writing {} reviews to {}".format(writeme, outfilename))
-		json.dump(self.reviews[:writeme], open(outfilename, "wt"), indent="\t")
+
+		towrite = self.sort_reviews(writeme)
+		json.dump(towrite, open(outfilename, "wt"), indent="\t")
 		# Validate *after* dumping, so the bad json can still be inspected
-		# after crash. Validating only up to `writeme' prevents some
-		# reviews from being validated multiple times needlessly
-		jsonschema.validate(self.reviews[:writeme], schema,
-					format_checker=jsonschema.Draft202012Validator.FORMAT_CHECKER)
-		del self.reviews[:writeme]
+		# after crash. Validating only the ones to be written prevents
+		# some reviews from being validated multiple times needlessly
+		jsonschema.validate(towrite, schema,
+				format_checker=jsonschema.Draft202012Validator.FORMAT_CHECKER)
 
 	def __init__(self, steamid, per_file=5000, date_type=Review_Stream.Date_Type.CREATED):
 		self.steamid = steamid	# constant
@@ -150,4 +167,4 @@ class Split_Reviews:
 
 # test
 logging.basicConfig(level=logging.DEBUG)
-Split_Reviews(1158310)
+Split_Reviews(1382330)

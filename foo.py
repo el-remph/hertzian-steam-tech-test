@@ -8,16 +8,15 @@ import jsonschema
 import logging
 import requests
 
+# hex string -- should we store as an integer?
+hex224_schema = {"type": "string", "pattern": "^[A-Fa-f0-9]{56}$"}
 schema = {
 	"type": "array",
 	"items": {
 		"type": "object",
 		"properties": {
-			# should be an integer, but steam gives it as a
-			# string so maybe they know something
-			"id":	{"type": "string"},
-			# hex string -- should we store as an integer?
-			"author":	{"type": "string", "pattern": "^[A-Fa-f0-9]{56}$"},
+			"id":	hex224_schema,
+			"author":	hex224_schema,
 			"date":	{"type": "string", "format": "date"},
 			"hours":	{"type": "integer"},
 			"content":	{"type": "string"},
@@ -49,12 +48,16 @@ class Review_Stream:
 			case _:
 				raise TypeError
 
+	@staticmethod
+	def hexdigest224(str):
+		return hashlib.blake2s(str.encode('utf-8'), digest_size=28).hexdigest()
+
 	# transforms steam input format review into output format review. obj is a
 	# decoded json dict from the reviews array
 	def xform_review(self, obj):
 		return {
-			'id'		: obj['recommendationid'],
-			'author'	: hashlib.blake2s(obj['author']['steamid'].encode('utf-8'), digest_size=28).hexdigest(),
+			'id'		: self.hexdigest224(obj['recommendationid']),
+			'author'	: self.hexdigest224(obj['author']['steamid']),
 			# TODO: UTC? timestamp_updated or timestamp_created?
 			'date'		: datetime.date.fromtimestamp(obj[self.timestamp]).isoformat(),
 			'hours'		: obj['author']['playtime_at_review'], # TODO: check presumption

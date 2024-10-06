@@ -50,15 +50,22 @@ class Review_Stream:
 				raise TypeError
 
 	@staticmethod
-	def hexdigest224(str):
-		return hashlib.blake2s(str.encode('utf-8'), digest_size=28).hexdigest()
+	def hexdigest(str, dgstsz):
+		return hashlib.blake2s(str.encode('utf-8'), digest_size=dgstsz).hexdigest()
 
 	# transforms steam input format review into output format review. obj is a
 	# decoded json dict from the reviews array
+	#
+	# For the UUID, hashing the Steam recommendation id and review content and
+	# then concatenating the hashes, rather than concatenating them first and
+	# then hashing that, prevents collisions as there doesn't seem to be any
+	# guarantee that the steam ID will be fixed-width. For example, consider
+	# if review A's Steam ID is a prefix substring of B's ID, and the opening
+	# bytes of A's review content make up the remainder of B's ID.
 	def xform_review(self, obj):
 		return {
-			'id'		: self.hexdigest224(obj['recommendationid']),
-			'author'	: self.hexdigest224(obj['author']['steamid']),
+			'id'		: self.hexdigest(obj['recommendationid'], 8) + self.hexdigest(obj['review'], 20),
+			'author'	: self.hexdigest(obj['author']['steamid'], 28),
 			# TODO: UTC? timestamp_updated or timestamp_created?
 			'date'		: datetime.date.fromtimestamp(obj[self.timestamp]).isoformat(),
 			'hours'		: obj['author']['playtime_at_review'], # TODO: check presumption

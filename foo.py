@@ -7,6 +7,7 @@ import hashlib
 import json
 import jsonschema
 import logging
+import multiprocessing
 import operator
 import requests
 
@@ -97,6 +98,53 @@ class Review_Stream:
 		reviews = [self.xform_review(x) for x in self.response_obj['reviews']]
 		return reviews
 
+
+def sort_reviews(reviews, n):
+	# Reviews are received already sorted by date (descending), so it
+	# would be wasteful to sort by id, then by date again. Instead,
+	# pop a contiguous portion of `reviews' with the same date,
+	# sort that, repeat until we have n reviews in `result'
+	result = []
+	while len(result) < n:
+		same_date = [reviews.pop(0)]
+		while len(same_date) + len(result) < n \
+			and reviews[0]['date'] == same_date[0]['date']:
+			same_date += [reviews.pop(0)]
+		same_date.sort(key=operator.itemgetter('id'))
+		result += same_date
+	return result, reviews
+
+def output_postproc(steamid, per_file, pipe): # note that pipe is read-only
+	# yes, I know logging with multiprocess has no guarantee of
+	# race-safety, I have simply chosen to ignore the warnings
+	logging.debug('output_postproc() process started')
+	file_i = 0
+	reviews = []
+	eof = False
+
+	while not eof or len(reviews) != 0:
+		if not eof:
+			try:
+				reviews += pipe.recv()
+			except EOFError:
+				eof = True
+				continue
+
+		outfilename = "{:d}.{:d}.json".format(steamid, file_i)
+		file_i += 1 # whatever happend to postincrement?
+		writeme = min(per_file, len(reviews))
+		logging.info("Writing {} reviews to {}".format(writeme, outfilename))
+
+		towrite, reviews = sort_reviews(reviews, writeme)
+		json.dump(towrite, open(outfilename, "wt"), indent="\t")
+
+		# Validate *after* dumping, so the bad json can still be inspected
+		# after crash. Validating only the ones to be written prevents
+		# some reviews from being validated multiple times needlessly
+		jsonschema.validate(towrite, schema,
+				format_checker=jsonschema.Draft202012Validator.FORMAT_CHECKER)
+
+
 class Split_Reviews:
 	def count_id_frequency(self, reviews):
 		for review in reviews:
@@ -109,7 +157,7 @@ class Split_Reviews:
 	async def getbatch(self):
 		if self.eof:
 			return False
-		reviews = await self.steam.nextbatch()
+		reviews = await self.input.nextbatch()
 		self.total -= len(reviews)
 		self.count_id_frequency(reviews)
 		self.reviews += reviews
@@ -118,42 +166,20 @@ class Split_Reviews:
 			self.eof = True
 		return not self.eof
 
-	def sort_reviews(self, n):
-		# Reviews are received already sorted by date (descending), so it
-		# would be wasteful to sort by id, then by date again. Instead,
-		# pop a contiguous portion of self.reviews with the same date,
-		# sort that, repeat until we have n reviews
-		result = []
-		while len(result) < n:
-			same_date = [self.reviews.pop(0)]
-			while len(same_date) + len(result) < n \
-				and self.reviews[0]['date'] == same_date[0]['date']:
-				same_date += [self.reviews.pop(0)]
-			same_date.sort(key=operator.itemgetter('id'))
-			result += same_date
-		return result
-
 	def writebatch(self):
-		# TODO: this should be async at least, and ideally run in another thread
-		outfilename = "{:d}.{:d}.json".format(self.steamid, self.file_i)
-		self.file_i += 1 # whatever happend to postincrement?
-		writeme = min(self.per_file, len(self.reviews))
-		logging.info("Writing {} reviews to {}".format(writeme, outfilename))
-
-		towrite = self.sort_reviews(writeme)
-		json.dump(towrite, open(outfilename, "wt"), indent="\t")
-		# Validate *after* dumping, so the bad json can still be inspected
-		# after crash. Validating only the ones to be written prevents
-		# some reviews from being validated multiple times needlessly
-		jsonschema.validate(towrite, schema,
-				format_checker=jsonschema.Draft202012Validator.FORMAT_CHECKER)
+		# Despite the name, this now sends all reviews to the output
+		# postprocessor process, which decides how many to write and
+		# accumulates leftovers for the next write
+		logging.debug('sending {:d} reviews to output'.format(len(self.reviews)))
+		self.output_pipe.send(self.reviews)
+		self.reviews = []
 
 	async def main_loop(self, date_type):
-		self.steam = Review_Stream(self.steamid, self.per_file, date_type)
+		self.input = Review_Stream(self.steamid, self.per_file, date_type)
 
 		# First request: get total_reviews also
 		await self.getbatch()
-		self.total = self.steam.response_obj['query_summary']['total_reviews'] - len(self.reviews)
+		self.total = self.input.response_obj['query_summary']['total_reviews'] - len(self.reviews)
 
 		while await self.getbatch():
 			if len(self.reviews) >= self.per_file:
@@ -164,15 +190,19 @@ class Split_Reviews:
 		self.reviews = []	# accumulates with each iteration
 		self.ids = {}	# counts frequency of each id (should all be 1)
 		self.total = 0	# decrements after each iter (set after first as a special case)
-		self.file_i = 0	# incremented monotonically
 		self.per_file = per_file	# constant
 		self.eof = False
-		self.steam = None
+		self.input = None # set in main_loop() because it's async
+		read_pipe, self.output_pipe = multiprocessing.Pipe(duplex=False)
+		self.output = multiprocessing.Process(target=output_postproc,
+							args=(steamid, per_file, read_pipe))
+		self.output.start()
 		asyncio.run(self.main_loop(date_type))
 
 	def __del__(self):
-		while len(self.reviews):
+		if len(self.reviews):
 			self.writebatch()
+		self.output_pipe.close()
 
 		if self.total != 0:
 			logging.warning('more reviews than expected: {:d}'.format(-self.total))
@@ -181,9 +211,13 @@ class Split_Reviews:
 			if dups != 0:
 				logging.warning('id "{}" has {:d} duplicates'.format(Id, dups))
 
-		if self.steam is not None:
-			logging.debug('final cursor was {}'.format(self.steam.response_obj['cursor']))
+		if self.input is not None:
+			logging.debug('final cursor was {}'.format(self.input.response_obj['cursor']))
 
-# test
+		self.output.join()
+
+
 logging.basicConfig(level=logging.DEBUG)
-Split_Reviews(1382330)
+if __name__ == '__main__':
+	multiprocessing.set_start_method('spawn')
+	Split_Reviews(1382330)

@@ -44,6 +44,7 @@ class Review_Stream:
 		self.steamid = steamid	# constant
 		self.n_max = n_max	# constant
 		self.params = {'json':1}
+		self.ids = set() # records review IDs to dedup them
 
 		match date_type:
 			case self.Date_Type.CREATED:
@@ -78,6 +79,7 @@ class Review_Stream:
 	# transforms steam input format review into output format review. obj is a
 	# decoded json dict from the reviews array
 	def xform_review(self, obj):
+		self.ids.add(obj['recommendationid'])
 		return {
 			'id'		: self.hexdigest224(obj['recommendationid']),
 			'author'	: self.hexdigest224(obj['author']['steamid']),
@@ -107,30 +109,22 @@ class Review_Stream:
 		self.request = asyncio.create_task(self.send_request(self.response_obj['cursor']))
 
 		# Note that `applicable' counts those within min_date, *without*
-		# checking max_date (it's just checking for those that meet
-		# Steam's own criteria), while the ultimate `reviews' uses both
+		# checking max_date or deduplicating -- it's just checking for
+		# those that meet Steam's own criteria
 		# TODO: date.fromtimestamp() is computed for every review twice;
 		# is it worth caching the results of the first one?
 		applicable = len([x for x in self.response_obj['reviews']
 				if self.min_date <= date.fromtimestamp(x[self.timestamp])])
 		reviews = [self.xform_review(x)
 				for x in self.response_obj['reviews']
-				if self.min_date <= date.fromtimestamp(x[self.timestamp]) <= self.max_date]
+				if self.min_date <= date.fromtimestamp(x[self.timestamp]) <= self.max_date
+				and not x['recommendationid'] in self.ids]
 		return applicable, reviews
 
 class Split_Reviews:
-	def count_id_frequency(self, reviews):
-		for review in reviews:
-			Id = review['id']
-			if Id in self.ids:
-				self.ids[Id] += 1
-			else:
-				self.ids[Id] = 0
-
 	async def getbatch(self):
 		applicable, reviews = await self.steam.nextbatch()
 		self.total -= applicable
-		self.count_id_frequency(reviews)
 		self.reviews += reviews
 		nreceived = len(self.steam.response_obj['reviews'])
 		logging.debug('received {:d} review{}; {:d} erroneous, {:d} kept; now have {:d}, with {:d} to go'.format(
@@ -171,7 +165,6 @@ class Split_Reviews:
 		self.steamid = steamid	# constant
 		self.per_file = per_file	# constant
 		self.reviews = []	# accumulates with each iteration
-		self.ids = {}	# counts frequency of each id (should all be 1)
 		self.total = 0	# decrements after each iter (set after first as a special case)
 		self.file_i = 0	# incremented monotonically
 		self.steam = None
@@ -183,10 +176,6 @@ class Split_Reviews:
 
 		if self.total != 0:
 			logging.warning('{:d} more reviews than expected'.format(-self.total))
-
-		for Id, dups in self.ids.items():
-			if dups != 0:
-				logging.warning('id "{}" has {:d} duplicates'.format(Id, dups))
 
 		if self.steam is not None:
 			logging.debug('final cursor was {}'.format(self.steam.response_obj['cursor']))

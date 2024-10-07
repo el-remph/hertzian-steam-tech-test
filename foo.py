@@ -1,5 +1,6 @@
 #!/usr/bin/python
 # vim: noexpandtab
+import asyncio
 import datetime
 import enum
 import hashlib
@@ -34,10 +35,13 @@ class Review_Stream:
 		CREATED = 0
 		UPDATED = 1
 
-	def __init__(self, steamid, date_type):
-		self.steamid = steamid # constant
-		self.cursor = '*' # assigned anew on each iteration
-		self.connection = requests.Session() # just to reuse the TCP connection
+	async def send_request(self, cursor):
+		return self.connection.get("https://store.steampowered.com/appreviews/{:d}".format(self.steamid),
+				params={'json':1, 'filter':self.filter, 'num_per_page':self.n_max, 'cursor':cursor})
+
+	def __init__(self, steamid, n_max, date_type):
+		self.steamid = steamid	# constant
+		self.n_max = n_max	# constant
 		match date_type:
 			case self.Date_Type.CREATED:
 				self.filter = 'recent'
@@ -47,6 +51,11 @@ class Review_Stream:
 				self.timestamp = 'timestamp_updated'
 			case _:
 				raise TypeError
+
+		# just to reuse the TCP connection
+		self.connection = requests.Session()
+		# init first request -- subsequent requests will be sent while looping
+		self.request = asyncio.create_task(self.send_request('*'))
 
 	@staticmethod
 	def hexdigest224(str):
@@ -66,14 +75,13 @@ class Review_Stream:
 			'source'	: 'steam',
 			'helpful'	: obj['votes_up'],
 			'funny'		: obj['votes_funny'],
-			'recommended' : obj['voted_up'] # apparently
+			'recommended'	: obj['voted_up'] # apparently
 			# TODO: franchise and gameName -- are they really to be stored
 			# separately for each review?
 		}
 
-	def nextbatch(self, n_max):
-		r = self.connection.get("https://store.steampowered.com/appreviews/{:d}".format(self.steamid),
-						params={'json':1, 'filter':self.filter, 'num_per_page':n_max, 'cursor':self.cursor})
+	async def nextbatch(self):
+		r = await self.request
 		r.raise_for_status()
 
 		self.response_obj = r.json()
@@ -81,8 +89,10 @@ class Review_Stream:
 			raise Exception('bad response')
 		assert self.response_obj['query_summary']['num_reviews'] == len(self.response_obj['reviews'])
 
-		self.cursor = self.response_obj['cursor'] # TODO: send next request asynchronously here, if not eof
+		if len(self.response_obj['reviews']) == 0:
+			return [] # EOF: rest of function not relevant
 
+		self.request = asyncio.create_task(self.send_request(self.response_obj['cursor']))
 		reviews = [self.xform_review(x) for x in self.response_obj['reviews']]
 		return reviews
 
@@ -95,10 +105,10 @@ class Split_Reviews:
 			else:
 				self.ids[Id] = 0
 
-	def getbatch(self):
+	async def getbatch(self):
 		if self.eof:
 			return False
-		reviews = self.steam.nextbatch(self.per_file)
+		reviews = await self.steam.nextbatch()
 		self.total -= len(reviews)
 		self.count_id_frequency(reviews)
 		self.reviews += reviews
@@ -108,6 +118,7 @@ class Split_Reviews:
 		return not self.eof
 
 	def writebatch(self):
+		# TODO: this should be async at least, and ideally run in another thread
 		outfilename = "{:d}.{:d}.json".format(self.steamid, self.file_i)
 		self.file_i += 1 # whatever happend to postincrement?
 		writeme = min(self.per_file, len(self.reviews))
@@ -120,6 +131,17 @@ class Split_Reviews:
 					format_checker=jsonschema.Draft202012Validator.FORMAT_CHECKER)
 		del self.reviews[:writeme]
 
+	async def main_loop(self, date_type):
+		self.steam = Review_Stream(self.steamid, self.per_file, date_type)
+
+		# First request: get total_reviews also
+		await self.getbatch()
+		self.total = self.steam.response_obj['query_summary']['total_reviews'] - len(self.reviews)
+
+		while await self.getbatch():
+			if len(self.reviews) >= self.per_file:
+				self.writebatch()
+
 	def __init__(self, steamid, per_file=5000, date_type=Review_Stream.Date_Type.CREATED):
 		self.steamid = steamid	# constant
 		self.reviews = []	# accumulates with each iteration
@@ -128,15 +150,8 @@ class Split_Reviews:
 		self.file_i = 0	# incremented monotonically
 		self.per_file = per_file	# constant
 		self.eof = False
-		self.steam = Review_Stream(steamid, date_type)
-
-		# First request: get total_reviews also
-		self.getbatch()
-		self.total = self.steam.response_obj['query_summary']['total_reviews'] - len(self.reviews)
-
-		while self.getbatch():
-			if len(self.reviews) >= self.per_file:
-				self.writebatch()
+		self.steam = None
+		asyncio.run(self.main_loop(date_type))
 
 	def __del__(self):
 		while len(self.reviews):
@@ -149,8 +164,9 @@ class Split_Reviews:
 			if dups != 0:
 				logging.warning('id "{}" has {:d} duplicates'.format(Id, dups))
 
-		logging.debug('final cursor was {}'.format(self.steam.cursor))
+		if self.steam is not None:
+			logging.debug('final cursor was {}'.format(self.steam.response_obj['cursor']))
 
 # test
 logging.basicConfig(level=logging.DEBUG)
-Split_Reviews(1158310)
+Split_Reviews(1382330)

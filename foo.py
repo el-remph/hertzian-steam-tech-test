@@ -138,7 +138,7 @@ class Split_Reviews:
 	async def writebatch_task(json_obj, outfilename):
 		json.dump(json_obj, open(outfilename, "wt"), indent="\t")
 
-	def writebatch(self):
+	def writebatch(self, jobs):
 		# TODO: making this asynchronous didn't achieve much. The lag is
 		# from the passes over the reviews, to sort, parse, and validate
 		# it. This needs to be run in another thread
@@ -148,40 +148,27 @@ class Split_Reviews:
 		logging.info("Writing {} reviews to {}".format(writeme, outfilename))
 
 		towrite = self.sort_reviews(writeme)
-		self.writejobs += [asyncio.create_task(self.writebatch_task(towrite, outfilename))]
+		jobs.create_task(self.writebatch_task(towrite, outfilename))
 		# Validate *after* dumping, so the bad json can still be inspected
 		# after crash. Validating only the ones to be written prevents
 		# some reviews from being validated multiple times needlessly
 		jsonschema.validate(towrite, schema,
 				format_checker=jsonschema.Draft202012Validator.FORMAT_CHECKER)
 
-	async def opportunistic_await(self):
-		# opportunistically await and delete any finished write jobs
-		i = 0
-		while i < len(self.writejobs):
-			if self.writejobs[i].done():
-				await self.writejobs.pop(i)
-			else:
-				i += 1
-
 	async def main_loop(self, date_type):
 		self.steam = Review_Stream(self.steamid, self.per_file, date_type)
+		async with asyncio.TaskGroup() as writejobs:
+			try:
+				# First request: get total_reviews also
+				await self.getbatch()
+				self.total = self.steam.response_obj['query_summary']['total_reviews'] - len(self.reviews)
 
-		try:
-			# First request: get total_reviews also
-			await self.getbatch()
-			self.total = self.steam.response_obj['query_summary']['total_reviews'] - len(self.reviews)
-
-			# TODO: poll between getbatch and any of the writejobs?
-			while await self.getbatch():
-				if len(self.reviews) >= self.per_file:
-					self.writebatch()
-				await self.opportunistic_await()
-		finally:
-			while len(self.reviews):
-				self.writebatch()
-			for job in self.writejobs:
-				await job
+				while await self.getbatch():
+					if len(self.reviews) >= self.per_file:
+						self.writebatch(writejobs)
+			finally:
+				while len(self.reviews):
+					self.writebatch(writejobs)
 
 	def __init__(self, steamid, per_file=5000, date_type=Review_Stream.Date_Type.CREATED):
 		self.steamid = steamid	# constant
@@ -190,7 +177,6 @@ class Split_Reviews:
 		self.total = 0	# decrements after each iter (set after first as a special case)
 		self.file_i = 0	# incremented monotonically
 		self.per_file = per_file	# constant
-		self.writejobs = []	# I had intended for a ring buffer here, but that shouldn't be necessary
 		self.eof = False
 		self.steam = None
 		self.write = None

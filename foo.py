@@ -114,18 +114,6 @@ def sort_reviews(reviews, n):
 		result += same_date
 	return result, reviews
 
-async def opportunistic_await(awaitables):
-	# opportunistically await (and delete, if result is assigned to input)
-	# any finished write jobs. TODO: poll between the pipe and the writejobs?
-	ret = []
-	while len(awaitables) != 0:
-		job = awaitables.pop(0)
-		if job.done():
-			await job
-		else:
-			ret += [job]
-	return ret
-
 async def writebatch_task(json_obj, outfilename):
 	json.dump(json_obj, open(outfilename, "wt"), indent="\t")
 
@@ -133,12 +121,8 @@ async def output_postproc_loop(steamid, per_file, pipe): # note that pipe is rea
 	file_i = 0
 	reviews = []
 	eof = False
-	writejobs = []
-
-	try:
+	async with asyncio.TaskGroup() as writejobs:
 		while not eof or len(reviews) != 0:
-			writejobs = await opportunistic_await(writejobs)
-
 			if not eof:
 				try:
 					reviews += pipe.recv()
@@ -152,16 +136,13 @@ async def output_postproc_loop(steamid, per_file, pipe): # note that pipe is rea
 			logging.info("Writing {} reviews to {}".format(writeme, outfilename))
 
 			towrite, reviews = sort_reviews(reviews, writeme)
-			writejobs += [asyncio.create_task(writebatch_task(towrite, outfilename))]
+			writejobs.create_task(writebatch_task(towrite, outfilename))
 
 			# Validate *after* dumping, so the bad json can still be inspected
 			# after crash. Validating only the ones to be written prevents
 			# some reviews from being validated multiple times needlessly
 			jsonschema.validate(towrite, schema,
 					format_checker=jsonschema.Draft202012Validator.FORMAT_CHECKER)
-	finally:
-		for job in writejobs:
-			await job
 
 
 def output_postproc(steamid, per_file, pipe):

@@ -3,3 +3,4 @@
 # all is well
 set -o pipefail
 grep -h '^[[:space:]]*"id":' "$@" | sort | uniq -cd
+grep -h '^[[:space:]]*"date":' "$@" | sort -cr

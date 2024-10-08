@@ -121,6 +121,7 @@ class Review_Stream:
 				and not x['recommendationid'] in self.ids]
 		return applicable, reviews
 
+
 class Split_Reviews:
 	async def getbatch(self):
 		applicable, reviews = await self.steam.nextbatch()
@@ -132,15 +133,23 @@ class Split_Reviews:
 				nreceived - applicable, len(reviews),
 				len(self.reviews), self.total))
 
-	def writebatch(self):
-		# TODO: this should be async at least, and ideally run in another thread
+	@staticmethod
+	async def writebatch_task(json_obj, outfilename):
+		json.dump(json_obj, open(outfilename, "wt"), indent="\t")
+
+	def writebatch(self, jobs):
+		# TODO: making this asynchronous didn't achieve much. The lag is
+		# from the passes over the reviews, to sort, parse, and validate
+		# it. This needs to be run in another thread
 		outfilename = "{:d}.{:d}.json".format(self.steamid, self.file_i)
 		self.file_i += 1 # whatever happend to postincrement?
 		writeme = min(self.per_file, len(self.reviews))
 		logging.info("Writing {} reviews to {}".format(writeme, outfilename))
+
 		self.reviews.sort(key=operator.itemgetter('id'))
 		self.reviews.sort(key=operator.itemgetter('date'), reverse=True)
-		json.dump(self.reviews[:writeme], open(outfilename, "wt"), indent="\t")
+		jobs.create_task(self.writebatch_task(self.reviews[:writeme], outfilename))
+
 		# Validate *after* dumping, so the bad json can still be inspected
 		# after crash. Validating only up to `writeme' prevents some
 		# reviews from being validated multiple times needlessly
@@ -150,15 +159,19 @@ class Split_Reviews:
 
 	async def main_loop(self, date_type, date_range):
 		self.steam = Review_Stream(self.steamid, self.per_file, date_type, date_range)
+		async with asyncio.TaskGroup() as writejobs:
+			try:
+				# First request: get total_reviews also
+				await self.getbatch()
+				self.total = self.steam.response_obj['query_summary']['total_reviews'] - len(self.reviews)
 
-		# First request: get total_reviews also
-		await self.getbatch()
-		self.total = self.steam.response_obj['query_summary']['total_reviews'] - len(self.reviews)
-
-		while self.total > 0:
-			await self.getbatch()
-			if len(self.reviews) >= self.per_file:
-				self.writebatch()
+				while self.total > 0:
+					await self.getbatch()
+					if len(self.reviews) >= self.per_file:
+						self.writebatch(writejobs)
+			finally:
+				while len(self.reviews):
+					self.writebatch(writejobs)
 
 
 	def __init__(self, steamid, date_range, per_file=5000, date_type=Review_Stream.Date_Type.CREATED):
@@ -171,9 +184,6 @@ class Split_Reviews:
 		asyncio.run(self.main_loop(date_type, date_range))
 
 	def __del__(self):
-		while len(self.reviews):
-			self.writebatch()
-
 		if self.total != 0:
 			logging.warning('{:d} more reviews than expected'.format(-self.total))
 

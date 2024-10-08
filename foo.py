@@ -7,6 +7,7 @@ import hashlib
 import json
 import jsonschema
 import logging
+import multiprocessing
 import operator
 import requests
 
@@ -122,74 +123,106 @@ class Review_Stream:
 		return applicable, reviews
 
 
+
+async def writebatch_task(json_obj, outfilename):
+	json.dump(json_obj, open(outfilename, "wt"), indent="\t")
+
+async def output_postproc_loop(steamid, per_file, pipe): # note that pipe is read-only
+	file_i = 0
+	reviews = []
+	eof = False
+	async with asyncio.TaskGroup() as writejobs:
+		while not eof or len(reviews) != 0:
+			if not eof:
+				try:
+					reviews += pipe.recv()
+				except EOFError:
+					eof = True
+					continue
+				reviews.sort(key=operator.itemgetter('id'))
+				reviews.sort(key=operator.itemgetter('date'), reverse=True)
+
+			outfilename = "{:d}.{:d}.json".format(steamid, file_i)
+			file_i += 1 # whatever happend to postincrement?
+			writeme = min(per_file, len(reviews))
+			logging.info("Writing {} reviews to {}".format(writeme, outfilename))
+
+			writejobs.create_task(writebatch_task(reviews[:writeme], outfilename))
+
+			# Validate *after* dumping, so the bad json can still be inspected
+			# after crash. Validating only up to `writeme' prevents some
+			# reviews from being validated multiple times needlessly
+			jsonschema.validate(reviews[:writeme], schema,
+						format_checker=jsonschema.Draft202012Validator.FORMAT_CHECKER)
+			del reviews[:writeme]
+
+
+def output_postproc(steamid, per_file, pipe):
+	# yes, I know logging with multiprocess has no guarantee of
+	# race-safety, I have simply chosen to ignore the warnings
+	logging.debug('output_postproc() process started')
+	# This whole function is really just a wrapper to start an asyncio loop
+	# of its own in this process. But could/should we use the asyncio loop in
+	# the first process?
+	asyncio.run(output_postproc_loop(steamid, per_file, pipe))
+
+
 class Split_Reviews:
 	async def getbatch(self):
-		applicable, reviews = await self.steam.nextbatch()
+		applicable, reviews = await self.input.nextbatch()
 		self.total -= applicable
 		self.reviews += reviews
-		nreceived = len(self.steam.response_obj['reviews'])
+		nreceived = len(self.input.response_obj['reviews'])
 		logging.debug('received {:d} review{}; {:d} erroneous, {:d} kept; now have {:d}, with {:d} to go'.format(
 				nreceived, "" if nreceived == 1 else "s",
 				nreceived - applicable, len(reviews),
 				len(self.reviews), self.total))
 
-	@staticmethod
-	async def writebatch_task(json_obj, outfilename):
-		json.dump(json_obj, open(outfilename, "wt"), indent="\t")
-
-	def writebatch(self, jobs):
-		# TODO: making this asynchronous didn't achieve much. The lag is
-		# from the passes over the reviews, to sort, parse, and validate
-		# it. This needs to be run in another thread
-		outfilename = "{:d}.{:d}.json".format(self.steamid, self.file_i)
-		self.file_i += 1 # whatever happend to postincrement?
-		writeme = min(self.per_file, len(self.reviews))
-		logging.info("Writing {} reviews to {}".format(writeme, outfilename))
-
-		self.reviews.sort(key=operator.itemgetter('id'))
-		self.reviews.sort(key=operator.itemgetter('date'), reverse=True)
-		jobs.create_task(self.writebatch_task(self.reviews[:writeme], outfilename))
-
-		# Validate *after* dumping, so the bad json can still be inspected
-		# after crash. Validating only up to `writeme' prevents some
-		# reviews from being validated multiple times needlessly
-		jsonschema.validate(self.reviews[:writeme], schema,
-					format_checker=jsonschema.Draft202012Validator.FORMAT_CHECKER)
-		del self.reviews[:writeme]
+	def writebatch(self):
+		# Despite the name, this now sends all reviews to the output
+		# postprocessor process, which decides how many to write and
+		# accumulates leftovers for the next write
+		logging.debug('sending {:d} reviews to output'.format(len(self.reviews)))
+		self.output_pipe.send(self.reviews)
+		self.reviews = []
 
 	async def main_loop(self, date_type, date_range):
-		self.steam = Review_Stream(self.steamid, self.per_file, date_type, date_range)
-		async with asyncio.TaskGroup() as writejobs:
-			try:
-				# First request: get total_reviews also
-				await self.getbatch()
-				self.total = self.steam.response_obj['query_summary']['total_reviews'] - len(self.reviews)
-
-				while self.total > 0:
-					await self.getbatch()
-					if len(self.reviews) >= self.per_file:
-						self.writebatch(writejobs)
-			finally:
-				while len(self.reviews):
-					self.writebatch(writejobs)
-
+		self.input = Review_Stream(self.steamid, self.per_file, date_type, date_range)
+		# First request: get total_reviews also
+		await self.getbatch()
+		self.total = self.input.response_obj['query_summary']['total_reviews'] - len(self.reviews)
+		while self.total > 0:
+			await self.getbatch()
+			if len(self.reviews) >= self.per_file:
+				self.writebatch()
 
 	def __init__(self, steamid, date_range, per_file=5000, date_type=Review_Stream.Date_Type.CREATED):
 		self.steamid = steamid	# constant
 		self.per_file = per_file	# constant
 		self.reviews = []	# accumulates with each iteration
 		self.total = 0	# decrements after each iter (set after first as a special case)
-		self.file_i = 0	# incremented monotonically
-		self.steam = None
+		self.input = None # set in main_loop() because it's async
+		read_pipe, self.output_pipe = multiprocessing.Pipe(duplex=False)
+		self.output = multiprocessing.Process(target=output_postproc,
+							args=(steamid, per_file, read_pipe))
+		self.output.start()
 		asyncio.run(self.main_loop(date_type, date_range))
 
 	def __del__(self):
+		if len(self.reviews):
+			self.writebatch()
+		self.output_pipe.close()
+
 		if self.total != 0:
 			logging.warning('{:d} more reviews than expected'.format(-self.total))
 
-		if self.steam is not None:
-			logging.debug('final cursor was {}'.format(self.steam.response_obj['cursor']))
+		if self.input is not None:
+			logging.debug('final cursor was {}'.format(self.input.response_obj['cursor']))
 
-# test
+		self.output.join()
+
+
 logging.basicConfig(level=logging.DEBUG)
-Split_Reviews(1382330, date_range=('2023-11-18', '2024-02-12'))
+if __name__ == '__main__':
+	multiprocessing.set_start_method('spawn')
+	Split_Reviews(1382330, date_range=('2023-11-18', '2024-02-12'))

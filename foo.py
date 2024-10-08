@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/python3
 # vim: noexpandtab
 import datetime
 import enum
@@ -126,38 +126,52 @@ class Split_Reviews:
 	def writebatch(self):
 		outfilename = "{:d}.{:d}.json".format(self.steamid, self.file_i)
 		self.file_i += 1 # whatever happend to postincrement?
+
 		writeme = min(self.per_file, len(self.reviews))
 		logging.info("Writing {} reviews to {}".format(writeme, outfilename))
 
 		towrite = self.sort_reviews(writeme)
-		json.dump(towrite, open(outfilename, "wt"), indent="\t")
+		with open(outfilename, "wt") as outfile:
+			json.dump(towrite, outfile, indent="\t")
 		# Validate *after* dumping, so the bad json can still be inspected
 		# after crash. Validating only the ones to be written prevents
 		# some reviews from being validated multiple times needlessly
 		jsonschema.validate(towrite, schema,
 				format_checker=jsonschema.Draft202012Validator.FORMAT_CHECKER)
+		if self.max_files is not None and self.file_i >= self.max_files:
+			assert not self.file_i > self.max_files
+			self.eof = True
 
-	def __init__(self, steamid, per_file=5000, date_type=Review_Stream.Date_Type.CREATED):
+	def __init__(self, steamid, per_file=5000, max_files=None, date_type=Review_Stream.Date_Type.CREATED):
 		self.steamid = steamid	# constant
 		self.reviews = []	# accumulates with each iteration
 		self.ids = {}	# counts frequency of each id (should all be 1)
 		self.total = 0	# decrements after each iter (set after first as a special case)
 		self.file_i = 0	# incremented monotonically
 		self.per_file = per_file	# constant
+		self.max_files = max_files	# constant
 		self.eof = False
+		self.flushed = False
 		self.steam = Review_Stream(steamid, date_type)
 
-		# First request: get total_reviews also
+		# First request: get total_reviews also. Construction implies making a
+		# network request, but not necessarily writing
 		self.getbatch()
 		self.total = self.steam.response_obj['query_summary']['total_reviews'] - len(self.reviews)
 
+
+	def loop(self):
 		while self.getbatch():
 			if len(self.reviews) >= self.per_file:
 				self.writebatch()
 
-	def __del__(self):
+	def end(self):
+		if self.flushed:
+			return
+
 		while len(self.reviews):
 			self.writebatch()
+		self.flushed = True
 
 		if self.total != 0:
 			logging.warning('more reviews than expected: {:d}'.format(-self.total))
@@ -168,6 +182,10 @@ class Split_Reviews:
 
 		logging.debug('final cursor was {}'.format(self.steam.cursor))
 
+	def __del__(self):
+		self.end()
+
 # test
-logging.basicConfig(level=logging.DEBUG)
-Split_Reviews(1382330)
+if __name__ == '__main__':
+	logging.basicConfig(level=logging.DEBUG)
+	Split_Reviews(1382330).loop()

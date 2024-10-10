@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/python3
 # vim: noexpandtab
 import asyncio
 import datetime
@@ -136,7 +136,8 @@ class Split_Reviews:
 
 	@staticmethod
 	async def writebatch_task(json_obj, outfilename):
-		json.dump(json_obj, open(outfilename, "wt"), indent="\t")
+		with open(outfilename, "wt") as outfile:
+			json.dump(json_obj, outfile, indent="\t")
 
 	def writebatch(self, jobs):
 		# TODO: making this asynchronous didn't achieve much. The lag is
@@ -144,6 +145,7 @@ class Split_Reviews:
 		# it. This needs to be run in another thread
 		outfilename = "{:d}.{:d}.json".format(self.steamid, self.file_i)
 		self.file_i += 1 # whatever happend to postincrement?
+
 		writeme = min(self.per_file, len(self.reviews))
 		logging.info("Writing {} reviews to {}".format(writeme, outfilename))
 
@@ -154,9 +156,12 @@ class Split_Reviews:
 		# some reviews from being validated multiple times needlessly
 		jsonschema.validate(towrite, schema,
 				format_checker=jsonschema.Draft202012Validator.FORMAT_CHECKER)
+		if self.max_files is not None and self.file_i >= self.max_files:
+			assert not self.file_i > self.max_files
+			self.eof = True
 
-	async def main_loop(self, date_type):
-		self.steam = Review_Stream(self.steamid, self.per_file, date_type)
+	async def main_loop(self):
+		self.steam = Review_Stream(self.steamid, self.per_file, self.date_type)
 		async with asyncio.TaskGroup() as writejobs:
 			try:
 				# First request: get total_reviews also
@@ -170,17 +175,17 @@ class Split_Reviews:
 				while len(self.reviews):
 					self.writebatch(writejobs)
 
-	def __init__(self, steamid, per_file=5000, date_type=Review_Stream.Date_Type.CREATED):
+	def __init__(self, steamid, per_file=5000, max_files=None, date_type=Review_Stream.Date_Type.CREATED):
 		self.steamid = steamid	# constant
 		self.reviews = []	# accumulates with each iteration
 		self.ids = {}	# counts frequency of each id (should all be 1)
 		self.total = 0	# decrements after each iter (set after first as a special case)
 		self.file_i = 0	# incremented monotonically
 		self.per_file = per_file	# constant
+		self.max_files = max_files	# constant
+		self.date_type = date_type
 		self.eof = False
 		self.steam = None
-		self.write = None
-		asyncio.run(self.main_loop(date_type))
 
 	def __del__(self):
 		if self.total != 0:
@@ -194,5 +199,6 @@ class Split_Reviews:
 			logging.debug('final cursor was {}'.format(self.steam.response_obj['cursor']))
 
 # test
-logging.basicConfig(level=logging.DEBUG)
-Split_Reviews(1382330)
+if __name__ == '__main__':
+	logging.basicConfig(level=logging.DEBUG)
+	asyncio.run(Split_Reviews(1382330).main_loop())

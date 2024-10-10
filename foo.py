@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/python3
 # vim: noexpandtab
 import asyncio
 import datetime
@@ -115,7 +115,8 @@ def sort_reviews(reviews, n):
 	return result, reviews
 
 async def writebatch_task(json_obj, outfilename):
-	json.dump(json_obj, open(outfilename, "wt"), indent="\t")
+	with open(outfilename, "wt") as outfile:
+		json.dump(json_obj, outfile, indent="\t")
 
 async def output_postproc_loop(steamid, per_file, pipe): # note that pipe is read-only
 	file_i = 0
@@ -183,9 +184,13 @@ class Split_Reviews:
 		logging.debug('sending {:d} reviews to output'.format(len(self.reviews)))
 		self.output_pipe.send(self.reviews)
 		self.reviews = []
+		self.file_i += 1
+		if self.max_files is not None and self.file_i >= self.max_files:
+			assert not self.file_i > self.max_files
+			self.eof = True
 
-	async def main_loop(self, date_type):
-		self.input = Review_Stream(self.steamid, self.per_file, date_type)
+	async def main_loop(self):
+		self.input = Review_Stream(self.steamid, self.per_file, self.date_type)
 
 		# First request: get total_reviews also
 		await self.getbatch()
@@ -195,24 +200,36 @@ class Split_Reviews:
 			if len(self.reviews) >= self.per_file:
 				self.writebatch()
 
-	def __init__(self, steamid, per_file=5000, date_type=Review_Stream.Date_Type.CREATED):
+	def __init__(self, steamid, per_file=5000, max_files=None, date_type=Review_Stream.Date_Type.CREATED):
 		self.steamid = steamid	# constant
+		self.per_file = per_file	# constant
+		self.max_files = max_files	# constant
+		self.date_type = date_type	# constant
 		self.reviews = []	# accumulates with each iteration
 		self.ids = {}	# counts frequency of each id (should all be 1)
 		self.total = 0	# decrements after each iter (set after first as a special case)
-		self.per_file = per_file	# constant
+		self.file_i = 0	# incremented monotonically
 		self.eof = False
+		self.flushed = False
+		self.output_started = False
 		self.input = None # set in main_loop() because it's async
 		read_pipe, self.output_pipe = multiprocessing.Pipe(duplex=False)
 		self.output = multiprocessing.Process(target=output_postproc,
 							args=(steamid, per_file, read_pipe))
-		self.output.start()
-		asyncio.run(self.main_loop(date_type))
 
-	def __del__(self):
+	def loop(self):
+		self.output.start()
+		self.output_started = True
+		asyncio.run(self.main_loop())
+
+	def end(self):
+		if self.flushed:
+			return
+
 		if len(self.reviews):
 			self.writebatch()
 		self.output_pipe.close()
+		self.flushed = True
 
 		if self.total != 0:
 			logging.warning('more reviews than expected: {:d}'.format(-self.total))
@@ -224,10 +241,13 @@ class Split_Reviews:
 		if self.input is not None:
 			logging.debug('final cursor was {}'.format(self.input.response_obj['cursor']))
 
-		self.output.join()
+		if self.output_started:
+			self.output.join()
 
+	def __del__(self):
+		self.end()
 
 logging.basicConfig(level=logging.DEBUG)
 if __name__ == '__main__':
 	multiprocessing.set_start_method('spawn')
-	Split_Reviews(1382330)
+	Split_Reviews(1382330).loop()

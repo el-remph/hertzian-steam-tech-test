@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/python3
 # vim: noexpandtab:ts=8
 from datetime import date
 import asyncio
@@ -135,7 +135,8 @@ class Split_Reviews:
 
 	@staticmethod
 	async def writebatch_task(json_obj, outfilename):
-		json.dump(json_obj, open(outfilename, "wt"), indent="\t")
+		with open(outfilename, "wt") as outfile:
+			json.dump(json_obj, outfile, indent="\t")
 
 	def writebatch(self, jobs):
 		# TODO: making this asynchronous didn't achieve much. The lag is
@@ -143,6 +144,7 @@ class Split_Reviews:
 		# it. This needs to be run in another thread
 		outfilename = "{:d}.{:d}.json".format(self.steamid, self.file_i)
 		self.file_i += 1 # whatever happend to postincrement?
+
 		writeme = min(self.per_file, len(self.reviews))
 		logging.info("Writing {} reviews to {}".format(writeme, outfilename))
 
@@ -157,15 +159,15 @@ class Split_Reviews:
 					format_checker=jsonschema.Draft202012Validator.FORMAT_CHECKER)
 		del self.reviews[:writeme]
 
-	async def main_loop(self, date_type, date_range):
-		self.steam = Review_Stream(self.steamid, self.per_file, date_type, date_range)
+	async def main_loop(self):
+		self.steam = Review_Stream(self.steamid, self.per_file, self.date_type, self.date_range)
 		async with asyncio.TaskGroup() as writejobs:
 			try:
 				# First request: get total_reviews also
 				await self.getbatch()
 				self.total = self.steam.response_obj['query_summary']['total_reviews'] - len(self.reviews)
 
-				while self.total > 0:
+				while self.total > 0 and (self.max_files is None or self.file_i < self.max_files):
 					await self.getbatch()
 					if len(self.reviews) >= self.per_file:
 						self.writebatch(writejobs)
@@ -174,14 +176,22 @@ class Split_Reviews:
 					self.writebatch(writejobs)
 
 
-	def __init__(self, steamid, date_range, per_file=5000, date_type=Review_Stream.Date_Type.CREATED):
+	def __init__(self, steamid, date_range, per_file=5000, max_files=None, date_type=Review_Stream.Date_Type.CREATED):
 		self.steamid = steamid	# constant
+		self.date_range = date_range	# constant
 		self.per_file = per_file	# constant
+		self.date_type = date_type	# constant
 		self.reviews = []	# accumulates with each iteration
 		self.total = 0	# decrements after each iter (set after first as a special case)
 		self.file_i = 0	# incremented monotonically
+		self.max_files = max_files
+		if self.max_files is not None:
+			self.max_files -= 1     # difference between 1- and 0-indexed
 		self.steam = None
-		asyncio.run(self.main_loop(date_type, date_range))
+		self.flushed = False
+
+	def loop(self):
+		asyncio.run(self.main_loop())
 
 	def __del__(self):
 		if self.total != 0:
@@ -191,5 +201,6 @@ class Split_Reviews:
 			logging.debug('final cursor was {}'.format(self.steam.response_obj['cursor']))
 
 # test
-logging.basicConfig(level=logging.DEBUG)
-Split_Reviews(1382330, date_range=('2023-11-18', '2024-02-12'))
+if __name__ == '__main__':
+	logging.basicConfig(level=logging.DEBUG)
+	Split_Reviews(1382330, date_range=('2023-11-18', '2024-02-12')).loop()

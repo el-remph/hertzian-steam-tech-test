@@ -96,7 +96,7 @@ class Test_File_Output(unittest.TestCase):
 	# This one's pretty bulky
 	def test_output(self):
 		olddir = os.getcwd()
-		tmpd = tempfile.TemporaryDirectory(delete=False)
+		tmpd = tempfile.TemporaryDirectory()
 		os.chdir(tmpd.name)
 
 		try:

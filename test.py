@@ -82,7 +82,7 @@ class Test_Schema(unittest.TestCase):
 class Test_Review_Stream(unittest.TestCase):
 	def setUp(self):
 		self.n_max = 25
-		self.reviews = foo.Review_Stream(1382330, foo.Review_Stream.Date_Type.UPDATED).nextbatch(self.n_max)
+		self.reviews = foo.Review_Stream(1382330, foo.Steam_Date_Type.UPDATED).nextbatch(self.n_max)
 
 	def test_valid(self):
 		jsonschema.validate(self.reviews, foo.schema,

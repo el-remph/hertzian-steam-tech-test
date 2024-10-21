@@ -94,9 +94,28 @@ class Test_Review_Stream(unittest.TestCase):
 
 class Test_File_Output(unittest.TestCase):
 	# This one's pretty bulky
+
+	def scan_reviews(self, reviews):
+		cur_id = '0' # compares less than any hex string
+		for r in reviews:
+			newdate = date.fromisoformat(r['date'])
+			self.assertFalse(newdate > self.curdate, msg='dates out of order')
+			if newdate < self.curdate:
+				self.curdate = newdate
+			else:
+				self.assertTrue(r['id'] > cur_id, msg='IDs out of order: {} {}'.format(r['id'], cur_id))
+
+			cur_id = r['id']
+			self.assertFalse(r['id'] in self.ids, msg='duplicate id')
+			self.ids.add(r['id'])
+
+	def setUp(self):
+		self.ids = set()
+		self.curdate = date(MAXYEAR, 12, 31)
+
 	def test_output(self):
 		olddir = os.getcwd()
-		tmpd = tempfile.TemporaryDirectory(delete=False)
+		tmpd = tempfile.TemporaryDirectory()
 		os.chdir(tmpd.name)
 
 		try:
@@ -110,27 +129,17 @@ class Test_File_Output(unittest.TestCase):
 			self.assertTrue(file_i == maxfiles)
 			del splitter
 
-			ids = set()
-			curdate = date(MAXYEAR, 12, 31)
-
 			for i in range(file_i):
 				with open('{:d}.{:d}.json'.format(steamid, i), 'r') as f:
 					reviews = json.load(f)
 				jsonschema.validate(reviews, foo.schema,
 						format_checker=jsonschema.Draft202012Validator.FORMAT_CHECKER)
-
 				self.assertTrue(len(reviews) <= nmax
 								if i == file_i - 1
 								else len(reviews) == nmax)
+				self.scan_reviews(reviews)
 
-				for r in reviews:
-					newdate = date.fromisoformat(r['date'])
-					self.assertFalse(newdate > curdate, 'dates out of order')
-					if newdate < curdate:
-						curdate = newdate
 
-					self.assertFalse(r['id'] in ids, msg='duplicate id')
-					ids.add(r['id'])
 		except:
 			logging.warning('Error in test, so {} not deleted; inspect and please delete yourself'
 							.format(tmpd.name))

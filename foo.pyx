@@ -122,20 +122,21 @@ cdef class Split_Reviews:
 			self.eof = True
 		return not self.eof
 
-	cdef list[Review] sort_reviews(self, const size_t n):
+	cdef void sort_reviews(self, const size_t n):
 		# Reviews are received already sorted by date (descending), so it
 		# would be wasteful to sort by id, then by date again. Instead,
-		# pop a contiguous portion of self.reviews with the same date,
+		# select a contiguous portion of self.reviews with the same date,
 		# sort that, repeat until we have n reviews
-		cdef list[Review] result = [], same_date
-		while len(result) < n:
-			same_date = [self.reviews.pop(0)]
-			while len(same_date) + len(result) < n \
-				and self.reviews[0]['date'] == same_date[0]['date']:
-				same_date += [self.reviews.pop(0)]
-			same_date.sort(key=operator.itemgetter('id'))
-			result += same_date
-		return result
+		cdef size_t begin = 0, end = 1
+		while begin + end < n:
+			while begin + end < n \
+				and self.reviews[end]['date'] == self.reviews[begin]['date']:
+				end += 1
+			# TODO: why can't we sort a slice in place?
+			self.reviews[begin:end] = \
+				sorted(self.reviews[begin:end], key=operator.itemgetter('id'))
+			begin = end
+			end += 1
 
 	cdef void writebatch(self):
 		cdef str outfilename = "{:d}.{:d}.json".format(self.steamid, self.file_i)
@@ -144,14 +145,15 @@ cdef class Split_Reviews:
 		cdef uintmax_t writeme = min(self.per_file, len(self.reviews))
 		logging.info("Writing {:d} reviews to {}".format(writeme, outfilename))
 
-		cdef list[Review] towrite = self.sort_reviews(writeme)
+		self.sort_reviews(writeme)
 		with open(outfilename, "wt") as outfile:
-			json.dump(towrite, outfile, indent="\t")
+			json.dump(self.reviews[:writeme], outfile, indent="\t")
 		# Validate *after* dumping, so the bad json can still be inspected
 		# after crash. Validating only the ones to be written prevents
 		# some reviews from being validated multiple times needlessly
-		jsonschema.validate(towrite, schema,
+		jsonschema.validate(self.reviews[:writeme], schema,
 				format_checker=jsonschema.Draft202012Validator.FORMAT_CHECKER)
+		del self.reviews[:writeme]
 		if self.max_files and self.file_i >= self.max_files:
 			assert not self.file_i > self.max_files
 			self.eof = True

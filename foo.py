@@ -1,5 +1,6 @@
 #!/usr/bin/python3
-# vim: noexpandtab
+# vim: noexpandtab:
+import dataclasses
 import datetime
 import enum
 import hashlib
@@ -30,6 +31,42 @@ schema = {
 	}
 }
 
+@dataclasses.dataclass(init=False)
+class Review:
+	@staticmethod
+	def hexdigest224(str):
+		return hashlib.blake2s(str.encode('utf-8'), digest_size=28).hexdigest()
+
+	id	: str
+	author	: str
+	date	: str
+	hours	: int
+	content	: str
+	comments	: int
+	source	: str
+	helpful	: int
+	funny	: int
+	recommended	: bool
+
+	# transforms steam input format review into output format review. obj is a
+	# decoded json dict from the reviews array
+	def __init__(self, obj, which_timestamp):
+		self.id		= self.hexdigest224(obj['recommendationid'])
+		self.author	= self.hexdigest224(obj['author']['steamid'])
+		self.date	= datetime.date.fromtimestamp(obj[which_timestamp]).isoformat() # TODO= UTC?
+		self.hours	= obj['author']['playtime_at_review']
+		self.content	= obj['review']
+		self.comments	= obj['comment_count']
+		self.source	= 'steam'
+		self.helpful	= obj['votes_up']
+		self.funny	= obj['votes_funny']
+		self.recommended	= obj['voted_up'] # apparently
+		# TODO: franchise and gameName -- are they really to be stored
+		# separately for each review?
+
+def reviews_dicts(reviews: list[Review]):	# convenience function
+	return [r.__dict__ for r in reviews]
+
 class Review_Stream:
 	class Date_Type(enum.Enum):
 		CREATED = 0
@@ -49,29 +86,6 @@ class Review_Stream:
 			case _:
 				raise TypeError
 
-	@staticmethod
-	def hexdigest224(str):
-		return hashlib.blake2s(str.encode('utf-8'), digest_size=28).hexdigest()
-
-	# transforms steam input format review into output format review. obj is a
-	# decoded json dict from the reviews array
-	def xform_review(self, obj):
-		return {
-			'id'		: self.hexdigest224(obj['recommendationid']),
-			'author'	: self.hexdigest224(obj['author']['steamid']),
-			# TODO: UTC? timestamp_updated or timestamp_created?
-			'date'		: datetime.date.fromtimestamp(obj[self.timestamp]).isoformat(),
-			'hours'		: obj['author']['playtime_at_review'], # TODO: check presumption
-			'content'	: obj['review'],
-			'comments'	: obj['comment_count'],
-			'source'	: 'steam',
-			'helpful'	: obj['votes_up'],
-			'funny'		: obj['votes_funny'],
-			'recommended'	: obj['voted_up'] # apparently
-			# TODO: franchise and gameName -- are they really to be stored
-			# separately for each review?
-		}
-
 	def nextbatch(self, n_max):
 		r = self.connection.get("https://store.steampowered.com/appreviews/{:d}".format(self.steamid),
 						params={'json':1, 'filter':self.filter, 'num_per_page':n_max, 'cursor':self.cursor})
@@ -84,13 +98,13 @@ class Review_Stream:
 
 		self.cursor = self.response_obj['cursor'] # TODO: send next request asynchronously here, if not eof
 
-		reviews = [self.xform_review(x) for x in self.response_obj['reviews']]
+		reviews = [Review(x, self.timestamp) for x in self.response_obj['reviews']]
 		return reviews
 
 class Split_Reviews:
 	def count_id_frequency(self, reviews):
 		for review in reviews:
-			Id = review['id']
+			Id = review.id
 			if Id in self.ids:
 				self.ids[Id] += 1
 			else:
@@ -117,9 +131,9 @@ class Split_Reviews:
 		while len(result) < n:
 			same_date = [self.reviews.pop(0)]
 			while len(same_date) + len(result) < n \
-				and self.reviews[0]['date'] == same_date[0]['date']:
+				and self.reviews[0].date == same_date[0].date:
 				same_date += [self.reviews.pop(0)]
-			same_date.sort(key=operator.itemgetter('id'))
+			same_date.sort(key=operator.attrgetter('id'))
 			result += same_date
 		return result
 
@@ -132,11 +146,11 @@ class Split_Reviews:
 
 		towrite = self.sort_reviews(writeme)
 		with open(outfilename, "wt") as outfile:
-			json.dump(towrite, outfile, indent="\t")
+			json.dump(reviews_dicts(towrite), outfile, indent="\t")
 		# Validate *after* dumping, so the bad json can still be inspected
 		# after crash. Validating only the ones to be written prevents
 		# some reviews from being validated multiple times needlessly
-		jsonschema.validate(towrite, schema,
+		jsonschema.validate(reviews_dicts(towrite), schema,
 				format_checker=jsonschema.Draft202012Validator.FORMAT_CHECKER)
 		if self.max_files is not None and self.file_i >= self.max_files:
 			assert not self.file_i > self.max_files

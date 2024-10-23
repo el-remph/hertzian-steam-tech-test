@@ -2,47 +2,54 @@
 # vim: noexpandtab:ts=8:shiftwidth=8:
 # cython: language_level=3str
 from libc.stdint cimport *
+from cython cimport dataclasses
 
 import datetime
 import hashlib
 import json
-import jsonschema
 import logging
 import operator
 import requests
 
-# hex string -- should we store as an integer?
-cdef dict[str, str] hex224_schema = {"type": "string", "pattern": "^[A-Fa-f0-9]{56}$"}
-# TODO: can we make this schema redundant by defining a review as a type-checked struct?
-schema : dict[str, type] = {
-	"type": "array",
-	"items": {
-		"type": "object",
-		"properties": {
-			"id":	hex224_schema,
-			"author":	hex224_schema,
-			"date":	{"type": "string", "format": "date"},
-			"hours":	{"type": "integer"},
-			"content":	{"type": "string"},
-			"comments":	{"type": "integer"},
-			"source":	{"type": "string", "pattern": "^steam$"},
-			"helpful":	{"type": "integer"},
-			"funny":	{"type": "integer"},
-			"recommended":	{"type": "boolean"}
-		}
-	}
-}
+cdef str hexdigest224(str s):
+	return hashlib.blake2s(s.encode('utf-8'), digest_size=28).hexdigest()
 
-ctypedef dict[str, type] Review
+@dataclasses.dataclass(init=False)
+cdef class Review:
+	# Unfortunately to maintain backwards-compatibility these must be
+	# declared in this order
+	cdef readonly str id, author, date
+	cdef readonly uintmax_t hours
+	cdef readonly str content
+	cdef readonly uintmax_t comments
+	cdef readonly str source
+	cdef readonly uintmax_t helpful, funny
+	cdef readonly bint recommended
+
+	# transforms steam input format review into output format review. obj is a
+	# decoded json dict from the reviews array
+	def __init__(self, obj, which_timestamp):
+		self.id		= hexdigest224(obj['recommendationid'])
+		self.author	= hexdigest224(obj['author']['steamid'])
+		self.date	= datetime.date.fromtimestamp(obj[which_timestamp]).isoformat() # TODO= UTC?
+		self.hours	= obj['author']['playtime_at_review']
+		self.content	= obj['review']
+		self.comments	= obj['comment_count']
+		self.source	= 'steam'
+		self.helpful	= obj['votes_up']
+		self.funny	= obj['votes_funny']
+		self.recommended	= obj['voted_up'] # apparently
+		# TODO: franchise and gameName -- are they really to be stored
+		# separately for each review?
+
+# Not pretty
+cpdef list[dict[str, type]] reviews_dicts(list[Review] reviews):
+	return [{name: r.__getattribute__(name)
+		for name in r.__dataclass_fields__.keys()}
+			for r in reviews]
 
 cpdef enum Steam_Date_Type:
 	CREATED, UPDATED
-
-# TODO: convert some strings to const memoryviews. Actually convert lots of
-# this to memoryviews
-
-cdef str hexdigest224(str s):
-	return hashlib.blake2s(s.encode('utf-8'), digest_size=28).hexdigest()
 
 cdef class Review_Stream:
 	# Member/attribute declarations
@@ -66,26 +73,6 @@ cdef class Review_Stream:
 		else:
 			raise TypeError
 
-	# transforms steam input format review into output format Review. obj is a
-	# decoded json dict from the reviews array. This is a pure function and a good
-	# place to optimise
-	cdef Review xform_review(self, dict obj):
-		return {
-			'id'		: hexdigest224(obj['recommendationid']),
-			'author'	: hexdigest224(obj['author']['steamid']),
-			# TODO: UTC? timestamp_updated or timestamp_created?
-			'date'		: datetime.date.fromtimestamp(obj[self.timestamp]).isoformat(),
-			'hours'		: obj['author']['playtime_at_review'],
-			'content'	: obj['review'],
-			'comments'	: obj['comment_count'],
-			'source'	: 'steam',
-			'helpful'	: obj['votes_up'],
-			'funny'		: obj['votes_funny'],
-			'recommended'	: obj['voted_up'] # apparently
-			# TODO: franchise and gameName -- are they really to be stored
-			# separately for each review?
-		}
-
 	cpdef list[Review] nextbatch(self, const uintmax_t n_max):
 		r = self.connection.get("https://store.steampowered.com/appreviews/{:d}".format(self.steamid),
 				params={'json':1, 'filter':self.filter_field, 'num_per_page':n_max, 'cursor':self.cursor})
@@ -97,12 +84,12 @@ cdef class Review_Stream:
 		assert self.response_obj['query_summary']['num_reviews'] == len(self.response_obj['reviews'])
 
 		self.cursor = self.response_obj['cursor'] # TODO: send next request asynchronously here, if not eof
-		return [self.xform_review(x) for x in self.response_obj['reviews']]
+		return [Review(x, self.timestamp) for x in self.response_obj['reviews']]
 
 cdef class Split_Reviews:
 	cdef void count_id_frequency(self, list[Review] reviews):
 		for review in reviews:
-			Id = review['id'] # again, I'd rather this be a uint but steam says string
+			Id = review.id
 			if Id in self.ids:
 				# this is slow because python insists on checking
 				# if self.ids is None *every single loop*
@@ -130,11 +117,11 @@ cdef class Split_Reviews:
 		cdef size_t begin = 0, end = 1
 		while begin + end < n:
 			while begin + end < n \
-				and self.reviews[end]['date'] == self.reviews[begin]['date']:
+				and self.reviews[end].date == self.reviews[begin].date:
 				end += 1
 			# TODO: why can't we sort a slice in place?
 			self.reviews[begin:end] = \
-				sorted(self.reviews[begin:end], key=operator.itemgetter('id'))
+				sorted(self.reviews[begin:end], key=operator.attrgetter('id'))
 			begin = end
 			end += 1
 
@@ -147,12 +134,7 @@ cdef class Split_Reviews:
 
 		self.sort_reviews(writeme)
 		with open(outfilename, "wt") as outfile:
-			json.dump(self.reviews[:writeme], outfile, indent="\t")
-		# Validate *after* dumping, so the bad json can still be inspected
-		# after crash. Validating only the ones to be written prevents
-		# some reviews from being validated multiple times needlessly
-		jsonschema.validate(self.reviews[:writeme], schema,
-				format_checker=jsonschema.Draft202012Validator.FORMAT_CHECKER)
+			json.dump(reviews_dicts(self.reviews[:writeme]), outfile, indent="\t")
 		del self.reviews[:writeme]
 		if self.max_files and self.file_i >= self.max_files:
 			assert not self.file_i > self.max_files

@@ -167,12 +167,12 @@ cdef class Split_Reviews:
 		self.total = self.steam.response_obj['query_summary']['total_reviews'] - len(self.reviews)
 
 
-	def loop(self):
+	cpdef loop(self):
 		while self.getbatch():
 			if len(self.reviews) >= self.per_file:
 				self.writebatch()
 
-	def end(self):
+	cpdef void end(self):
 		if self.flushed:
 			return
 

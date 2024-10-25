@@ -1,6 +1,6 @@
-#!/usr/bin/python3
-# vim: noexpandtab:ts=8:shiftwidth=8:
 # cython: language_level=3str
+# distutils: extra_compile_args = -march=native -mtune=native
+# vim: noexpandtab:ts=8:shiftwidth=8:
 from libc.stdint cimport *
 from cython cimport dataclasses
 
@@ -126,9 +126,11 @@ cdef class Split_Reviews:
 		# select a contiguous portion of self.reviews with the same date,
 		# sort that, repeat until we have n reviews
 		cdef size_t begin = 0, end = 1
+		cdef str begin_date
 		while begin + end < n:
+			begin_date = self.reviews[begin].date
 			while begin + end < n \
-				and self.reviews[end].date == self.reviews[begin].date:
+					and self.reviews[end].date == begin_date:
 				end += 1
 			# TODO: why can't we sort a slice in place?
 			self.reviews[begin:end] = \
